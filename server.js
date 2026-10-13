@@ -282,7 +282,10 @@ async function tick() {
           log('paid', o.id);
           try {
             const r = await open(o);
-            await lnd.post('/v2/invoices/settle', { preimage: Buffer.from(o.preimage, 'hex').toString('base64') });
+            // The channel is out: take the fee. If that fails (the payment timed out meanwhile)
+            // the channel stays, the fee is lost; it is logged.
+            await lnd.post('/v2/invoices/settle', { preimage: Buffer.from(o.preimage, 'hex').toString('base64') })
+              .catch((e) => log('settle failed after opening', o.id, e.message));
             o.status = 'opening'; o.fundingTxid = r.txid; o.minUntil = now + MIN_DAYS * 86400;
             state.channels.push({ pubkey: o.pubkey, point: `${r.txid}:${r.index}`, sats: o.sats, opened: now, minUntil: o.minUntil, order: o.id });
             delete o.preimage; save();
@@ -307,7 +310,14 @@ async function tick() {
     if (['expired', 'failed', 'open'].includes(o.status) && now - o.created > 7 * 86400) delete state.orders[id];
   }
 }
-setInterval(() => { tick().catch((e) => log('tick', e.message)); }, 3000);
+// One pass at a time: an open can take minutes, and two passes seeing the same accepted payment
+// would each open a channel for it.
+let ticking = false;
+setInterval(() => {
+  if (ticking) return;
+  ticking = true;
+  tick().catch((e) => log('tick', e.message)).finally(() => { ticking = false; });
+}, 3000);
 
 // ---------------------------------------------------------------- HTTP
 const bad = (m) => Object.assign(new Error(m), { http: 400 });
