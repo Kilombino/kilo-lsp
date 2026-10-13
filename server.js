@@ -200,15 +200,74 @@ async function open(o) {
     const a = await available(o.id);
     if (a.free < o.sats) throw new Error('not enough confirmed liquidity any more');
     const rate = await feeRate();
-    // Every confirmed coin goes in: the channel gets o.sats and the change comes back as one coin.
-    const outpoints = a.coins.map((c) => ({ txid_str: c.txid, output_index: c.vout }));
-    const r = await lnd.post('/v1/channels', {
-      node_pubkey: hexToB64(o.pubkey), local_funding_amount: String(o.sats), sat_per_vbyte: String(rate),
-      private: true, min_confs: 1, spend_unconfirmed: false, outpoints,
+    // Every confirmed coin goes in: the channel gets o.sats and the change comes back as one
+    // coin. LND's own coin selection would take only what it needs even from a given list, so
+    // the funding transaction is built here as a PSBT with all of them (the PSBT funding flow).
+    const r = await openWithAllCoins(o, a.coins, rate);
+    return { ...r, rate, coins: a.coins.length };
+  });
+}
+
+// OpenChannel with a PSBT shim: LND gives the channel's funding address and amount; FundPsbt
+// builds a transaction spending exactly the coins given (plus change); LND checks it, the wallet
+// signs it, and LND publishes it. Any failure cancels the pending channel and frees the coins.
+function openWithAllCoins(o, coins, rate) {
+  const pendingId = crypto.randomBytes(32);
+  return new Promise((resolve, reject) => {
+    let step = 'start', done = false, buf = '', leases = [];
+    const fail = async (e) => {
+      if (done) return; done = true; req.destroy();
+      await lnd.post('/v1/funding/step', { shim_cancel: { pending_chan_id: pendingId.toString('base64') } }).catch(() => {});
+      // FundPsbt leases the coins for ten minutes: give them back at once.
+      for (const l of leases) await lnd.post('/v2/wallet/utxos/release', { id: l.id, outpoint: l.outpoint }).catch(() => {});
+      reject(e);
+    };
+    const body = JSON.stringify({
+      node_pubkey: hexToB64(o.pubkey), local_funding_amount: String(o.sats), private: true,
       memo: `kilowallet-lsp ${o.id}`,
-    }, { timeout: 120000 });
-    const txid = r.funding_txid_str || Buffer.from(r.funding_txid_bytes || '', 'base64').reverse().toString('hex');
-    return { txid, index: r.output_index || 0, rate, coins: outpoints.length };
+      funding_shim: { psbt_shim: { pending_chan_id: pendingId.toString('base64'), no_publish: false } },
+    });
+    const req = require('https').request({
+      host: '127.0.0.1', port: 8280, path: '/v1/channels/stream', method: 'POST', agent: lnd.agent,
+      headers: { 'Grpc-Metadata-macaroon': lnd.macaroon, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, (res) => {
+      res.setEncoding('utf8');
+      res.on('data', async (chunk) => {
+        buf += chunk;
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+          if (!line) continue;
+          let m; try { m = JSON.parse(line); } catch { continue; }
+          if (m.error) return fail(new Error(m.error.message || 'LND refused the channel'));
+          const u = m.result || {};
+          if (u.psbt_fund && step === 'start') {
+            step = 'funding';
+            try {
+              const addr = u.psbt_fund.funding_address, amt = Number(u.psbt_fund.funding_amount);
+              const funded = await lnd.post('/v2/wallet/psbt/fund', {
+                raw: { inputs: coins.map((c) => ({ txid_str: c.txid, output_index: c.vout })), outputs: { [addr]: String(amt) } },
+                sat_per_vbyte: String(rate), min_confs: 1, spend_unconfirmed: false,
+                change_type: 'CHANGE_ADDRESS_TYPE_P2TR',
+              });
+              leases = funded.locked_utxos || [];
+              await lnd.post('/v1/funding/step', { psbt_verify: { pending_chan_id: pendingId.toString('base64'), funded_psbt: funded.funded_psbt } });
+              const fin = await lnd.post('/v2/wallet/psbt/finalize', { funded_psbt: funded.funded_psbt });
+              await lnd.post('/v1/funding/step', { psbt_finalize: { pending_chan_id: pendingId.toString('base64'), signed_psbt: fin.signed_psbt } });
+              step = 'published';
+            } catch (e) { return fail(e); }
+          } else if (u.chan_pending && !done) {
+            done = true; req.destroy();
+            const txid = Buffer.from(u.chan_pending.txid || '', 'base64').reverse().toString('hex');
+            return resolve({ txid, index: u.chan_pending.output_index || 0 });
+          }
+        }
+      });
+      res.on('end', () => { if (!done) fail(new Error('LND closed the channel stream at step ' + step)); });
+    });
+    req.on('error', (e) => fail(e));
+    setTimeout(() => fail(new Error('the channel did not open in time (step ' + step + ')')), 180000);
+    req.end(body);
   });
 }
 
