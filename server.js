@@ -145,7 +145,10 @@ async function quote(body) {
 
   const msg = `kilowallet-lsp:v1:${pubkey}:${sats}:${ts}`;
   const v = await lnd.post('/v1/verifymessage', { msg: Buffer.from(msg).toString('base64'), signature });
-  if (!v.valid || v.pubkey !== pubkey) throw bad('the signature is not from that node');
+  // LND's `valid` is only true for nodes in its public graph, and a wallet's node is private.
+  // The pubkey it recovers from the signature is what proves it: a signature not made by that
+  // key over this exact message recovers a different one.
+  if (v.pubkey !== pubkey) throw bad('the signature is not from that node');
   if (Object.values(state.orders).some((o) => o.sig === signature)) throw bad('this request was already used');
 
   return locked(async () => {
