@@ -33,6 +33,7 @@ const FEE_PER_MILLION = 5_000;
 const RESERVE_SATS = 300_000;          // never committed: fees, anchors, the next close
 const MIN_DAYS = 90;                   // channels are kept open at least this long
 const QUOTE_TTL_S = 600;
+const UNSIGNED_TTL_S = 300;
 const MAX_PER_PEER = 50_000_000;       // channels opened by us to one node, in total
 const MAX_ACTIVE = 3;                  // open requests at once, overall
 const SIG_WINDOW_S = 300;
@@ -157,22 +158,33 @@ async function info() {
   };
 }
 
-async function quote(body) {
+async function quote(body, ip) {
   const { pubkey, sats, ts, signature } = body || {};
   const host = body?.host ? String(body.host).trim() : null;
   if (!/^0[23][0-9a-f]{64}$/.test(pubkey || '')) throw bad('pubkey');
   if (!Number.isInteger(sats) || sats < MIN_SATS || sats > MAX_SATS || sats % 1_000_000) throw bad('sats must be whole millions from 1 to 50');
-  if (!Number.isInteger(ts) || Math.abs(Date.now() / 1000 - ts) > SIG_WINDOW_S) throw bad('the request is too old: check the phone clock');
-  if (typeof signature !== 'string' || signature.length < 20 || signature.length > 200) throw bad('signature');
-
-  const msg = `kilowallet-lsp:v1:${pubkey}:${sats}:${ts}`;
-  const v = await lnd.post('/v1/verifymessage', { msg: Buffer.from(msg).toString('base64'), signature });
-  // LND's `valid` is only true for nodes in its public graph, and a wallet's node is private.
-  // The pubkey it recovers from the signature is what proves it: a signature not made by that
-  // key over this exact message recovers a different one.
-  if (v.pubkey !== pubkey) throw bad('the signature is not from that node');
-  if (Object.values(state.orders).some((o) => o.sig === signature)) throw bad('this request was already used');
+  // Signed requests (Kilowallet) prove the node is the buyer's. Unsigned ones (the web page)
+  // must give the node's address so we connect to it; whoever pays gets a channel opened to
+  // that node, which still has to accept it. To keep unpaid unsigned quotes from holding the
+  // liquidity, each visitor can only have one waiting at a time, for a shorter time.
+  const signed = signature != null && signature !== '';
+  if (signed) {
+    if (!Number.isInteger(ts) || Math.abs(Date.now() / 1000 - ts) > SIG_WINDOW_S) throw bad('the request is too old: check the phone clock');
+    if (typeof signature !== 'string' || signature.length < 20 || signature.length > 200) throw bad('signature');
+    const msg = `kilowallet-lsp:v1:${pubkey}:${sats}:${ts}`;
+    const v = await lnd.post('/v1/verifymessage', { msg: Buffer.from(msg).toString('base64'), signature });
+    // LND's `valid` is only true for nodes in its public graph, and a wallet's node is private.
+    // The pubkey it recovers from the signature is what proves it: a signature not made by that
+    // key over this exact message recovers a different one.
+    if (v.pubkey !== pubkey) throw bad('the signature is not from that node');
+    if (Object.values(state.orders).some((o) => o.sig === signature)) throw bad('this request was already used');
+  } else {
+    if (!host) throw bad('give your node as pubkey@host:port');
+    const mine = active().filter((o) => o.unsigned && o.ip === ip && o.status === 'waiting_payment').length;
+    if (mine >= (ip === 'tor' ? 3 : 1)) throw busy('you already have a request waiting for payment: pay it or let it expire first');
+  }
   if (host) await checkHost(host);
+  const ttl = signed ? QUOTE_TTL_S : UNSIGNED_TTL_S;
 
   return locked(async () => {
     if (active().some((o) => o.pubkey === pubkey)) throw bad('your node already has a request in progress');
@@ -193,17 +205,17 @@ async function quote(body) {
     const fee = feeFor(sats);
     const inv = await lnd.post('/v2/invoices/hodl', {
       memo: `Inbound channel of ${sats} sats from Kilombino (kept ${MIN_DAYS}+ days)`,
-      hash: hash.toString('base64'), value: String(fee), expiry: String(QUOTE_TTL_S),
+      hash: hash.toString('base64'), value: String(fee), expiry: String(ttl),
     });
     const id = crypto.randomBytes(8).toString('hex');
     const now = Math.floor(Date.now() / 1000);
     state.orders[id] = {
-      id, pubkey, sats, fee, status: 'waiting_payment', created: now, expires: now + QUOTE_TTL_S,
+      id, pubkey, sats, fee, status: 'waiting_payment', created: now, expires: now + ttl, unsigned: !signed, ip: signed ? undefined : ip,
       hash: hash.toString('hex'), preimage: preimage.toString('hex'), sig: signature, host,
     };
     save();
     log('quote', id, pubkey.slice(0, 16), sats, 'fee', fee);
-    return { id, invoice: inv.payment_request, fee, sats, expires: now + QUOTE_TTL_S, minDays: MIN_DAYS };
+    return { id, invoice: inv.payment_request, fee, sats, expires: now + ttl, minDays: MIN_DAYS };
   });
 }
 
@@ -302,6 +314,8 @@ function openWithAllCoins(o, coins, rate) {
 async function tick() {
   const now = Math.floor(Date.now() / 1000);
   for (const o of Object.values(state.orders)) {
+    // A visitor's address is only kept while its quote waits for payment.
+    if (o.ip && o.status !== 'waiting_payment') { delete o.ip; save(); }
     try {
       if (o.status === 'waiting_payment') {
         const inv = await lookup(o.hash);
@@ -370,7 +384,7 @@ http.createServer(async (req, res) => {
       if (rateLimited(ip)) return send(res, 429, { error: 'too many requests: try again later' });
       let body = '';
       for await (const c of req) { body += c; if (body.length > 4096) return send(res, 413, { error: 'too big' }); }
-      return send(res, 200, await quote(JSON.parse(body || '{}')));
+      return send(res, 200, await quote(JSON.parse(body || '{}'), ip));
     }
     send(res, 404, { error: 'not found' });
   } catch (e) {
