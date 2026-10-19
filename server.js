@@ -90,6 +90,27 @@ async function peerConnected(pubkey) {
   return (r.peers || []).some((p) => p.pub_key === pubkey);
 }
 
+// The buyer may give its node's address (host:port, as in pubkey@host:port): then we connect
+// to it ourselves instead of waiting for it to connect to us. Only Tor addresses and public
+// IPs or names that resolve to public IPs: an address is the buyer's to choose, and it must
+// not point our node at our own network.
+const PRIVATE = [/^127\./, /^10\./, /^192\.168\./, /^172\.(1[6-9]|2\d|3[01])\./, /^169\.254\./, /^0\./, /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./,
+  /^::1$/, /^::$/, /^f[cd]/i, /^fe80/i, /^::ffff:/i];
+async function checkHost(host) {
+  const m = /^(?:\[([0-9a-f:]+)\]|([a-z0-9.-]+)):(\d{1,5})$/i.exec(host || '');
+  if (!m || Number(m[3]) < 1 || Number(m[3]) > 65535) throw bad('the address must look like host:port');
+  const name = (m[1] || m[2]).toLowerCase();
+  if (/^[a-z2-7]{56}\.onion$/.test(name)) return;
+  const addrs = require('net').isIP(name) ? [name]
+    : (await require('dns').promises.lookup(name, { all: true }).catch(() => { throw bad('that address does not resolve'); })).map((a) => a.address);
+  if (!addrs.length || addrs.some((a) => PRIVATE.some((r) => r.test(a)))) throw bad('that address is not a public one');
+}
+async function connectTo(pubkey, host) {
+  if (await peerConnected(pubkey)) return;
+  await lnd.post('/v1/peers', { addr: { pubkey, host }, perm: false, timeout: '25' }).catch(() => {});
+  for (let i = 0; i < 10 && !(await peerConnected(pubkey)); i++) await new Promise((r) => setTimeout(r, 1000));
+}
+
 async function openedToPeer(pubkey) {
   const r = await lnd.get(`/v1/channels?peer=${encodeURIComponent(hexToB64(pubkey))}`);
   const open = (r.channels || []).filter((c) => c.initiator).reduce((s, c) => s + Number(c.capacity || 0), 0);
@@ -138,6 +159,7 @@ async function info() {
 
 async function quote(body) {
   const { pubkey, sats, ts, signature } = body || {};
+  const host = body?.host ? String(body.host).trim() : null;
   if (!/^0[23][0-9a-f]{64}$/.test(pubkey || '')) throw bad('pubkey');
   if (!Number.isInteger(sats) || sats < MIN_SATS || sats > MAX_SATS || sats % 1_000_000) throw bad('sats must be whole millions from 1 to 50');
   if (!Number.isInteger(ts) || Math.abs(Date.now() / 1000 - ts) > SIG_WINDOW_S) throw bad('the request is too old: check the phone clock');
@@ -150,11 +172,16 @@ async function quote(body) {
   // key over this exact message recovers a different one.
   if (v.pubkey !== pubkey) throw bad('the signature is not from that node');
   if (Object.values(state.orders).some((o) => o.sig === signature)) throw bad('this request was already used');
+  if (host) await checkHost(host);
 
   return locked(async () => {
     if (active().some((o) => o.pubkey === pubkey)) throw bad('your node already has a request in progress');
     if (active().length >= MAX_ACTIVE) throw busy('busy with other requests: try again in a few minutes');
-    if (!(await peerConnected(pubkey))) throw bad('your node is not connected to ours: open the LIGHTNING tab and wait for "1 peer"');
+    if (host) await connectTo(pubkey, host);
+    if (!(await peerConnected(pubkey))) {
+      throw bad(host ? 'could not connect to your node at that address: check it is online and reachable'
+        : 'your node is not connected to ours: open the LIGHTNING tab and wait for "1 peer"');
+    }
     const already = await openedToPeer(pubkey);
     if (already + sats > MAX_PER_PEER) throw bad(`we already have ${already} sats of channels with your node; the most is ${MAX_PER_PEER}`);
     const a = await available();
@@ -172,7 +199,7 @@ async function quote(body) {
     const now = Math.floor(Date.now() / 1000);
     state.orders[id] = {
       id, pubkey, sats, fee, status: 'waiting_payment', created: now, expires: now + QUOTE_TTL_S,
-      hash: hash.toString('hex'), preimage: preimage.toString('hex'), sig: signature,
+      hash: hash.toString('hex'), preimage: preimage.toString('hex'), sig: signature, host,
     };
     save();
     log('quote', id, pubkey.slice(0, 16), sats, 'fee', fee);
@@ -196,6 +223,7 @@ const cancel = (o) => lnd.post('/v2/invoices/cancel', { payment_hash: Buffer.fro
 
 async function open(o) {
   return locked(async () => {
+    if (o.host) await connectTo(o.pubkey, o.host);
     if (!(await peerConnected(o.pubkey))) throw new Error('your node went offline before the channel could open');
     const a = await available(o.id);
     if (a.free < o.sats) throw new Error('not enough confirmed liquidity any more');
