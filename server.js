@@ -14,7 +14,8 @@
 //    opened by us to the same node;
 //  - the wallet must be connected to us when it asks and when the channel opens;
 //  - requests are signed with the node key and only good for a few minutes.
-// Each channel is opened with all the confirmed coins, so the change consolidates them.
+// Each channel is funded with chosen coins (pickCoins): the smallest one that pays, or else the
+// small ones smallest first, so dust consolidates and the big coins stay free for other uses.
 
 const http = require('http');
 const crypto = require('crypto');
@@ -94,8 +95,11 @@ async function confirmedUtxos() {
   const r = await lnd.get('/v1/utxos?min_confs=1&max_confs=2147483647');
   return (r.utxos || []).map((u) => ({
     txid: u.outpoint.txid_str, vout: u.outpoint.output_index || 0, sats: Number(u.amount_sat || 0),
+    type: u.address_type || '',
   }));
 }
+
+const { pickCoins } = require('./coins');
 
 async function available(excludeId) {
   const coins = await confirmedUtxos();
@@ -258,18 +262,18 @@ async function open(o) {
     const a = await available(o.id);
     if (a.free < o.sats) throw new Error('not enough confirmed liquidity any more');
     const rate = await feeRate();
-    // Every confirmed coin goes in: the channel gets o.sats and the change comes back as one
-    // coin. LND's own coin selection would take only what it needs even from a given list, so
-    // the funding transaction is built here as a PSBT with all of them (the PSBT funding flow).
-    const r = await openWithAllCoins(o, a.coins, rate);
-    return { ...r, rate, coins: a.coins.length };
+    // The chosen coins go in (pickCoins), built here as a PSBT with exactly them (the PSBT
+    // funding flow): LND's own selection would rather spend the biggest coin.
+    const coins = pickCoins(a.coins, o.sats, rate);
+    const r = await openWithCoins(o, coins, rate);
+    return { ...r, rate, coins: coins.length };
   });
 }
 
 // OpenChannel with a PSBT shim: LND gives the channel's funding address and amount; FundPsbt
 // builds a transaction spending exactly the coins given (plus change); LND checks it, the wallet
 // signs it, and LND publishes it. Any failure cancels the pending channel and frees the coins.
-function openWithAllCoins(o, coins, rate) {
+function openWithCoins(o, coins, rate) {
   const pendingId = crypto.randomBytes(32);
   return new Promise((resolve, reject) => {
     let step = 'start', done = false, buf = '', leases = [];
@@ -410,3 +414,4 @@ http.createServer(async (req, res) => {
     send(res, e.http || 500, { error: e.http ? e.message : 'internal error' });
   }
 }).listen(PORT, '127.0.0.1', () => log('kilo-lsp listening on', PORT));
+
