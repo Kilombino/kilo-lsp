@@ -54,11 +54,29 @@ function log(...a) {
 // ---------------------------------------------------------------- state
 let state = { orders: {}, channels: [] };
 try { state = JSON.parse(fs.readFileSync(STATE, 'utf8')); } catch { /* fresh */ }
+// A reduced copy for other services on the node that must keep the LSP's
+// coins aside (Kiloswap's guard): amounts, statuses and expiry only, no
+// keys, preimages or node ids. LSP_PUBLIC_STATE is its path (unset: none).
+const PUBLIC_STATE = process.env.LSP_PUBLIC_STATE || '';
+function savePublic() {
+  if (!PUBLIC_STATE) return;
+  const orders = {};
+  for (const [id, o] of Object.entries(state.orders || {})) {
+    orders[id] = { sats: o.sats, status: o.status, expires: o.expires, unsigned: !!o.unsigned };
+  }
+  try {
+    const tmp = PUBLIC_STATE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify({ orders }), { mode: 0o644 });
+    fs.renameSync(tmp, PUBLIC_STATE);
+  } catch (e) { console.error('public state:', e.message); }
+}
 function save() {
   const tmp = STATE + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(state, null, 1), { mode: 0o600 });
   fs.renameSync(tmp, STATE);
+  savePublic();
 }
+savePublic();
 
 // One at a time for anything that counts or spends the node's coins.
 let chain = Promise.resolve();
