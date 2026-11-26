@@ -17,3 +17,5 @@ ones smallest first (dust consolidates, up to 10), and the biggest coin only whe
 pays. Tests: `node --test coins.test.js`.
 
 Runs as the user service `kilo-lsp` on 127.0.0.1:3240; config, macaroon and state in `~/.config/kilo-lsp` (not in this repo).
+
+License: MIT (see LICENSE).
