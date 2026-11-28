@@ -1,8 +1,8 @@
 'use strict';
-// node --test coins.test.js
+// node --test 'test/*.test.js'
 const test = require('node:test');
 const assert = require('node:assert');
-const { pickCoins } = require('./coins');
+const { pickCoins } = require('../coins');
 const c = (n, sats, type = 'TAPROOT_PUBKEY') => ({ txid: 't' + n, vout: 0, sats, type });
 const big = c(1, 346_000_000);
 const smalls = [c(2, 5_000), c(3, 30_000), c(4, 12_000), c(5, 200_000), c(6, 3_000_000)];
